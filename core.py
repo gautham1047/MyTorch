@@ -2,7 +2,7 @@ import numpy as np
 from typing import Any, Callable
 
 
-def _first_of_each(entries: list[tuple[str, Any]]) -> list[tuple[str, Any]]:
+def _no_dupes(entries: list[tuple[str, Any]]) -> list[tuple[str, Any]]:
     """Keep the first (name, value) pair for each distinct object."""
     seen = set()
     return [(name, v) for name, v in entries if not (id(v) in seen or seen.add(id(v)))]
@@ -69,20 +69,12 @@ class Module:
         """Direct sub-modules, found by scanning attributes in definition order."""
         return list({id(mod): mod for _, mod in self._named_children()}.values())
 
-    def modules(self) -> list["Module"]:
-        """self followed by every descendant module, depth first."""
-        ret = [self]
-        for mod in self.children():
-            ret += mod.modules()
-
-        return list({id(mod): mod for mod in ret}.values())
-
     def named_parameters(self, prefix: str = "") -> list[tuple[str, Parameter]]:
-        """Recursively collect Parameters with dotted names, e.g. ('0.W', p).
+        """Recursively collect Parameters with dotted names, e.g. ('0.weight', p).
         Order must be deterministic: optimizers and torch weight copying rely on it.
         As in torch, a module's own parameters come before its children's, and a shared
         parameter is only listed once."""
-        return _first_of_each(self._named_members(Module._own_parameters, prefix + "." if prefix else ""))
+        return _no_dupes(self._named_members(Module._own_parameters, prefix + "." if prefix else ""))
 
     def _own_parameters(self) -> list[tuple[str, Parameter]]:
         return [(name, v) for name, v in vars(self).items() if isinstance(v, Parameter)]
@@ -108,7 +100,7 @@ class Module:
 
     def named_buffers(self, prefix: str = "") -> list[tuple[str, np.ndarray]]:
         """Non-trainable state, e.g. BatchNorm running_mean / running_var."""
-        return _first_of_each(self._named_members(Module._own_buffers, prefix + "." if prefix else ""))
+        return _no_dupes(self._named_members(Module._own_buffers, prefix + "." if prefix else ""))
 
     def zero_grad(self) -> None:
         """Zero every parameter's grad."""
@@ -134,14 +126,16 @@ class Module:
         if not np.issubdtype(dtype, np.inexact):
             raise TypeError(f"Module.to only accepts floating point or complex dtypes, but got {dtype}")
 
-        for para in self.parameters():
+        for _, para in self._own_parameters():
             if np.issubdtype(para.data.dtype, np.inexact):
                 para.to(dtype)
 
-        for mod in self.modules():
-            for name, buf in mod._own_buffers():
-                if np.issubdtype(buf.dtype, np.inexact):
-                    setattr(mod, name, buf.astype(dtype))
+        for name, buf in self._own_buffers():
+            if np.issubdtype(buf.dtype, np.inexact):
+                setattr(self, name, buf.astype(dtype))
+
+        for mod in self.children():
+            mod.to(dtype)
 
         return self
 
