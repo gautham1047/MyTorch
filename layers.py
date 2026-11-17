@@ -7,7 +7,6 @@ class Linear(Module):
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True,
                  init: str = "he", rng: np.random.Generator | None = None) -> None:
-        """init='he': weight ~ N(0, 2/in). init='xavier': weight ~ N(0, 2/(in+out)). bias = 0."""
         super().__init__()
         rng = rng if rng is not None else np.random.default_rng()
         if init == "he":
@@ -21,7 +20,7 @@ class Linear(Module):
         self.x = None
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        """x (N, in) -> x @ weight.T + bias, shape (N, out). Cache x for backprop."""
+        """x (N, in) -> (N, out)."""
         self.x = x
         ret = x @ self.weight.data.T
         if self.bias is not None:
@@ -30,7 +29,6 @@ class Linear(Module):
         return ret
 
     def backward(self, dout: np.ndarray) -> np.ndarray:
-        """weight.grad += dout.T @ x;  bias.grad += dout.sum(0);  return dout @ weight."""
         if self.x is None:
             raise Exception('cannot run backward pass before forward pass')
         
@@ -43,13 +41,11 @@ class Linear(Module):
     
 class ReLU(Module):
     def forward(self, x: np.ndarray) -> np.ndarray:
-        """mask = x.real > 0 (cached); return np.where(mask, x, 0)."""
         mask = x.real > 0
         self.mask = mask
         return np.where(mask, x, 0)
     
     def backward(self, dout: np.ndarray) -> np.ndarray:
-        """return dout * mask."""
         return dout * self.mask
     
 class Dropout(Module):
@@ -65,8 +61,6 @@ class Dropout(Module):
         self.mask = None
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        """Train: mask = (rng.random(x.shape) >= p) / (1 - p); return x * mask.
-        If frozen, reuse the cached mask. Eval: return x unchanged (mask = 1)."""
         if self.training:
             if not self.frozen or self.mask is None:
                 # cast so a float32 input stays float32
@@ -149,15 +143,13 @@ class BatchNorm2d(BatchNorm1d):
         super().__init__(num_channels, eps, momentum)
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        """x (N, C, H, W): transpose to (N*H*W, C), run BatchNorm1d.forward, reshape back.
-        Statistics are per channel over N, H, W; the unbiased factor uses N*H*W."""
+        """x (N, C, H, W)."""
         N, C, H, W = x.shape
         x2d = np.einsum('nchw->nhwc', x).reshape(-1, C)        # (N*H*W, C)
         out = super().forward(x2d)
         return np.einsum('nhwc->nchw', out.reshape(N, H, W, C))   # (N, C, H, W)
 
     def backward(self, dout: np.ndarray) -> np.ndarray:
-        """Same reshape, BatchNorm1d.backward, reshape back."""
         N, C, H, W = dout.shape
         x2d = np.einsum('nchw->nhwc', dout).reshape(-1, C)        # (N*H*W, C)
         out = super().backward(x2d)
@@ -165,12 +157,10 @@ class BatchNorm2d(BatchNorm1d):
 
 class Flatten(Module):
     def forward(self, x: np.ndarray) -> np.ndarray:
-        """Cache x.shape; return x.reshape(N, -1)."""
         self.shape = x.shape
         return x.reshape(x.shape[0], -1)
 
     def backward(self, dout: np.ndarray) -> np.ndarray:
-        """return dout.reshape(cached_shape)."""
         return dout.reshape(self.shape)
     
 def conv_output(in_size: int, k: int, stride: int, pad: int) -> int: 
@@ -221,7 +211,6 @@ class Conv2d(Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int | tuple[int, int],
                  stride: int = 1, padding: int = 0, bias: bool = True,
                  rng: np.random.Generator | None = None) -> None:
-        """He init: weight ~ N(0, 2 / (C*kh*kw)); bias = 0."""
         super().__init__()
         rng = rng if rng is not None else np.random.default_rng()
         kh, kw = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
@@ -235,7 +224,7 @@ class Conv2d(Module):
         self.cols = None
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        """x (N, C, H, W) -> (N, F, out_h, out_w). Cache cols and x.shape for backprop."""
+        """x (N, C, H, W) -> (N, F, out_h, out_w)."""
         N = x.shape[0]
         F = self.weight.shape[0]
         cols, out_h, out_w = im2col(x, self.kh, self.kw, self.stride, self.padding)
@@ -248,7 +237,6 @@ class Conv2d(Module):
         return out.reshape(N, out_h, out_w, F).transpose(0, 3, 1, 2)
 
     def backward(self, dout: np.ndarray) -> np.ndarray:
-        """Same as Linear on the im2col matrix, then col2im to get dL/dx."""
         if self.cols is None:
             raise Exception('cannot run backward pass before forward pass')
 
@@ -264,12 +252,32 @@ class Conv2d(Module):
     
 class MaxPool2d(Module):
     def __init__(self, kernel_size: int = 2, stride: int | None = None) -> None:
-        """stride defaults to kernel_size. No padding."""
+        super().__init__()
+        self.k = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.idx = None
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        """Reshape x to (N*C, 1, H, W), im2col -> (N*C*oh*ow, k*k).
-        idx = cols.real.argmax(1) (cached); out = cols[arange, idx] reshaped to (N, C, oh, ow)."""
+        """x (N, C, H, W) -> (N, C, out_h, out_w)."""
+        N, C, H, W = x.shape
+        cols, out_h, out_w = im2col(x.reshape(N * C, 1, H, W), self.k, self.k, self.stride, 0)
+
+        self.idx = cols.real.argmax(axis=1)
+        self.x_shape = x.shape
+        self.cols_shape = cols.shape
+        self.dtype = cols.dtype
+
+        out = cols[np.arange(cols.shape[0]), self.idx]
+        return out.reshape(N, C, out_h, out_w)
 
     def backward(self, dout: np.ndarray) -> np.ndarray:
-        """dcols = zeros; dcols[arange, idx] = dout.ravel(); col2im back to (N, C, H, W).
-        Overlapping windows (stride < k) accumulate correctly through col2im."""
+        """Overlapping windows (stride < k) accumulate correctly through col2im."""
+        if self.idx is None:
+            raise Exception('cannot run backward pass before forward pass')
+
+        N, C, H, W = self.x_shape
+        dcols = np.zeros(self.cols_shape, dtype=np.result_type(self.dtype, dout.dtype))
+        dcols[np.arange(dcols.shape[0]), self.idx] = dout.ravel()
+
+        dx = col2im(dcols, (N * C, 1, H, W), self.k, self.k, self.stride, 0)
+        return dx.reshape(N, C, H, W)
