@@ -1,4 +1,4 @@
-from core import Parameter, Module, Sequential
+from core import Parameter, Module
 import numpy as np
 
 class Linear(Module):
@@ -172,3 +172,104 @@ class Flatten(Module):
     def backward(self, dout: np.ndarray) -> np.ndarray:
         """return dout.reshape(cached_shape)."""
         return dout.reshape(self.shape)
+    
+def conv_output(in_size: int, k: int, stride: int, pad: int) -> int: 
+    return (in_size + 2 * pad - k) // stride + 1
+
+def im2col(x: np.ndarray, kh: int, kw: int, stride: int, pad: int) -> tuple[np.ndarray, int, int]:
+    N, C, H, W = x.shape
+    out_h = conv_output(H, kh, stride, pad)
+    out_w = conv_output(W, kw, stride, pad)
+    if out_h <= 0 or out_w <= 0:
+        raise ValueError(f"kernel ({kh}, {kw}) is larger than padded input ({H + 2*pad}, {W + 2*pad})")
+
+    x_pad = np.pad(x, ((0, 0), (0, 0), (pad, pad), (pad, pad)))
+    cols = np.empty((N, C, kh, kw, out_h, out_w), dtype=x.dtype)
+
+    # loop over kernel offsets only; each slice grabs that offset for every output position at once
+    for i in range(kh):
+        i_end = i + stride * out_h
+        for j in range(kw):
+            j_end = j + stride * out_w
+            cols[:, :, i, j] = x_pad[:, :, i:i_end:stride, j:j_end:stride]
+
+    cols = cols.transpose(0, 4, 5, 1, 2, 3).reshape(N * out_h * out_w, C * kh * kw)
+    return cols, out_h, out_w
+
+def col2im(cols: np.ndarray, x_shape: tuple[int, int, int, int], kh: int, kw: int,
+           stride: int, pad: int) -> np.ndarray:
+    N, C, H, W = x_shape
+    out_h = conv_output(H, kh, stride, pad)
+    out_w = conv_output(W, kw, stride, pad)
+
+    cols = cols.reshape(N, out_h, out_w, C, kh, kw).transpose(0, 3, 4, 5, 1, 2)  # (N, C, kh, kw, oh, ow)
+    x_pad = np.zeros((N, C, H + 2 * pad, W + 2 * pad), dtype=cols.dtype)
+
+    # within one (i, j) offset the strided slice never hits a pixel twice, so += is safe
+    for i in range(kh):
+        i_end = i + stride * out_h
+        for j in range(kw):
+            j_end = j + stride * out_w
+            x_pad[:, :, i:i_end:stride, j:j_end:stride] += cols[:, :, i, j]
+
+    return x_pad[:, :, pad:pad + H, pad:pad + W]
+
+class Conv2d(Module):
+    weight: Parameter   # (out_channels, in_channels, kh, kw)
+    bias: Parameter     # (out_channels,) if bias else None
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int | tuple[int, int],
+                 stride: int = 1, padding: int = 0, bias: bool = True,
+                 rng: np.random.Generator | None = None) -> None:
+        """He init: weight ~ N(0, 2 / (C*kh*kw)); bias = 0."""
+        super().__init__()
+        rng = rng if rng is not None else np.random.default_rng()
+        kh, kw = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+
+        var = 2 / (in_channels * kh * kw)
+        self.weight = Parameter(rng.standard_normal((out_channels, in_channels, kh, kw)) * np.sqrt(var))
+        self.bias = Parameter(np.zeros(out_channels)) if bias else None
+        self.kh, self.kw = kh, kw
+        self.stride = stride
+        self.padding = padding
+        self.cols = None
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        """x (N, C, H, W) -> (N, F, out_h, out_w). Cache cols and x.shape for backprop."""
+        N = x.shape[0]
+        F = self.weight.shape[0]
+        cols, out_h, out_w = im2col(x, self.kh, self.kw, self.stride, self.padding)
+        self.cols, self.x_shape = cols, x.shape
+
+        out = cols @ self.weight.data.reshape(F, -1).T          # (N*oh*ow, F)
+        if self.bias is not None:
+            out = out + self.bias.data
+
+        return out.reshape(N, out_h, out_w, F).transpose(0, 3, 1, 2)
+
+    def backward(self, dout: np.ndarray) -> np.ndarray:
+        """Same as Linear on the im2col matrix, then col2im to get dL/dx."""
+        if self.cols is None:
+            raise Exception('cannot run backward pass before forward pass')
+
+        F = dout.shape[1]
+        dout2d = dout.transpose(0, 2, 3, 1).reshape(-1, F)      # (N*oh*ow, F)
+
+        self.weight.grad += (dout2d.T @ self.cols).reshape(self.weight.shape)
+        if self.bias is not None:
+            self.bias.grad += dout2d.sum(axis=0)
+
+        dcols = dout2d @ self.weight.data.reshape(F, -1)         # (N*oh*ow, C*kh*kw)
+        return col2im(dcols, self.x_shape, self.kh, self.kw, self.stride, self.padding)
+    
+class MaxPool2d(Module):
+    def __init__(self, kernel_size: int = 2, stride: int | None = None) -> None:
+        """stride defaults to kernel_size. No padding."""
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        """Reshape x to (N*C, 1, H, W), im2col -> (N*C*oh*ow, k*k).
+        idx = cols.real.argmax(1) (cached); out = cols[arange, idx] reshaped to (N, C, oh, ow)."""
+
+    def backward(self, dout: np.ndarray) -> np.ndarray:
+        """dcols = zeros; dcols[arange, idx] = dout.ravel(); col2im back to (N, C, H, W).
+        Overlapping windows (stride < k) accumulate correctly through col2im."""
